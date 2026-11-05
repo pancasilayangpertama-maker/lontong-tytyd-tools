@@ -1,0 +1,190 @@
+name: Rapikan zip
+
+# Cara pakai: upload file .zip ke folder utama repo (Add file > Upload files > Commit).
+# Workflow ini membuka zip-nya, menaruh tiap file di foldernya, menghapus zip-nya, lalu memulai build.
+# Isi zip harus sudah tersusun seperti repo, contoh: marshall_ix9/app.py dan marshall_ix9/ui/pages.py.
+# File di .github/workflows/ dilewati, karena GitHub melarang workflow mengubah workflow. Tempel manual.
+# Opsional: file _hapus.txt di dalam zip (satu path per baris) untuk membuang file lama dari repo.
+on:
+  push:
+    branches: [main, master]
+    paths: ["*.zip"]
+  workflow_dispatch:
+
+concurrency:
+  group: rapikan
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  rapikan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Susun isi zip ke folder yang benar
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+
+          ROOT = pathlib.Path.cwd()
+          SKIP_PARTS = {"__pycache__", "__MACOSX", ".git"}
+          SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+          placed, removed, skipped = [], [], []
+
+
+          def safe_parts(name):
+              # pecah nama di dalam zip jadi bagian-bagian path yang aman (garis miring biasa maupun terbalik)
+              parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+              if not parts or ".." in parts or ":" in parts[0]:
+                  return None
+              return parts
+
+
+          def unpack(zf, dest):
+              for info in zf.infolist():
+                  if info.filename.endswith(("/", "\\")):
+                      continue
+                  parts = safe_parts(info.filename)
+                  if parts is None or SKIP_PARTS & set(parts):
+                      continue
+                  if parts[-1] in SKIP_NAMES or parts[-1].endswith(".pyc"):
+                      continue
+                  target = dest.joinpath(*parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info) as src, open(target, "wb") as out:
+                      shutil.copyfileobj(src, out)
+
+
+          def content_root(dest):
+              # kalau semua isi zip dibungkus satu folder (seperti Download ZIP dari GitHub), masuk ke dalamnya
+              entries = list(dest.iterdir())
+              if len(entries) == 1 and entries[0].is_dir():
+                  inner = entries[0]
+                  if (inner / "main.py").exists() or (inner / "marshall_ix9").is_dir() or (inner / "requirements.txt").exists():
+                      return inner
+              return dest
+
+
+          def delete_listed(src):
+              # opsional: _hapus.txt di dalam zip, satu path per baris, untuk membuang file lama dari repo
+              listing = src / "_hapus.txt"
+              if not listing.exists():
+                  return
+              for line in listing.read_text(encoding="utf-8", errors="ignore").splitlines():
+                  rel = line.strip().replace("\\", "/").strip("/")
+                  if not rel or rel.startswith("#"):
+                      continue
+                  parts = rel.split("/")
+                  if ".." in parts or ":" in parts[0] or parts[0] in (".git", ".github"):
+                      skipped.append(f"{rel} (tidak boleh dihapus)")
+                      continue
+                  target = ROOT / rel
+                  if target.is_dir():
+                      shutil.rmtree(target)
+                      removed.append(rel + "/")
+                  elif target.is_file():
+                      target.unlink()
+                      removed.append(rel)
+                  else:
+                      skipped.append(f"{rel} (tidak ada)")
+
+
+          zips = sorted(p for p in ROOT.iterdir() if p.is_file() and p.suffix.lower() == ".zip")
+          if not zips:
+              print("Tidak ada file .zip di folder utama, jadi tidak ada yang dirapikan.")
+              sys.exit(0)
+
+          for z in zips:
+              print(f"== {z.name}")
+              try:
+                  zf = zipfile.ZipFile(z)
+              except zipfile.BadZipFile:
+                  skipped.append(f"{z.name} (zip rusak, dibiarkan)")
+                  continue
+              with tempfile.TemporaryDirectory() as tmp, zf:
+                  dest = pathlib.Path(tmp)
+                  unpack(zf, dest)
+                  src = content_root(dest)
+                  for f in sorted(src.rglob("*")):
+                      if not f.is_file():
+                          continue
+                      rel = f.relative_to(src).as_posix()
+                      if rel == "_hapus.txt":
+                          continue
+                      if rel.lower().endswith(".zip"):
+                          skipped.append(f"{rel} (zip di dalam zip)")
+                          continue
+                      if rel.startswith(".github/workflows/"):
+                          skipped.append(f"{rel} (file workflow harus ditempel manual)")
+                          continue
+                      target = ROOT / rel
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(f, target)
+                      placed.append(rel)
+                  delete_listed(src)
+              z.unlink()
+
+          # file yang masuk daftar .gitignore tetap dipaksa ikut, karena kamu sengaja memasukkannya ke zip
+          ignored = [r for r in placed if subprocess.run(["git", "check-ignore", "-q", "--", r]).returncode == 0]
+          if ignored:
+              subprocess.run(["git", "add", "-f", "--", *ignored], check=False)
+
+          lines = ["## Rapikan selesai", ""]
+          lines.append(f"Dipasang atau ditimpa: **{len(placed)}** file. Dihapus: **{len(removed)}**. Dilewati: **{len(skipped)}**.")
+          for title, items in (("Dipasang", placed), ("Dihapus", removed), ("Dilewati", skipped)):
+              if items:
+                  lines += ["", f"**{title}**"] + [f"- `{item}`" for item in items[:200]]
+          text = "\n".join(lines) + "\n"
+          print(text)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write(text)
+          PY
+
+      - name: Simpan hasilnya ke repo
+        id: simpan
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Tidak ada perubahan untuk disimpan."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "Rapikan: susun isi zip ke folder yang benar"
+          pushed=0
+          for attempt in 1 2 3; do
+            if git push; then
+              pushed=1
+              break
+            fi
+            git pull --rebase
+          done
+          if [ "$pushed" != 1 ]; then
+            echo "Gagal menyimpan ke repo."
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mulai build
+        if: steps.simpan.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run build.yml --ref "${{ github.ref_name }}"
+          echo "Build dimulai. Lihat hasilnya di tab Actions > Build Marshall IX9." >> "$GITHUB_STEP_SUMMARY"
